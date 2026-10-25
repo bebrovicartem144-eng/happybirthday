@@ -127,11 +127,16 @@ const COMPOSITIONS = {
   }
 };
 
-// Создаём импульсный отклик концертного зала для мягкого объёмного ревербератора
+// Односекундный тихий WAV в формате data-URI для перевода iPhone/iOS из режима "Звонок" (блокируется рычажком беззвучного режима)
+// в режим "Медиаплеер" (играет через динамики даже при включённом беззвучном режиме на iPhone)
+const SILENT_WAV_DATA_URI = 'data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA';
+let iosMediaUnlocker = null;
+let audioUnlocked = false;
+
+// Создаём импульсный отклик концертного зала для мягкого объёмного ревербератора (оптимизировано для мобильных процессоров)
 function createConcertHallReverb(ctx) {
-  const duration = 3.2;
-  const decay = 2.6;
-  const sampleRate = ctx.sampleRate;
+  const duration = 2.2;
+  const sampleRate = ctx.sampleRate || 44100;
   const length = Math.floor(sampleRate * duration);
   const impulse = ctx.createBuffer(2, length, sampleRate);
 
@@ -140,10 +145,11 @@ function createConcertHallReverb(ctx) {
     let lastOut = 0.0;
     for (let i = 0; i < length; i++) {
       const white = Math.random() * 2 - 1;
-      // Мягкий розовый фильтр для естественной теплоты зала
-      lastOut = (lastOut + (0.04 * white)) / 1.04;
-      const env = Math.pow(1 - i / length, decay);
-      channelData[i] = lastOut * env * 1.8;
+      lastOut = (lastOut + (0.045 * white)) / 1.045;
+      const ratio = 1 - i / length;
+      // Быстрое возведение в степень без тяжёлого Math.pow на каждом сэмпле
+      const env = ratio * ratio * ratio;
+      channelData[i] = lastOut * env * 1.85;
     }
   }
   const convolver = ctx.createConvolver();
@@ -151,22 +157,68 @@ function createConcertHallReverb(ctx) {
   return convolver;
 }
 
-function initAudioEngine() {
-  if (!audioCtx) {
-    const AudioConstructor = window.AudioContext || window.webkitAudioContext;
-    if (!AudioConstructor) return;
-    audioCtx = new AudioConstructor();
+// Мгновенная синхронная разблокировка звука для мобильных браузеров (iOS Safari, Android Chrome, Telegram/VK браузеры)
+function unlockMobileAudio() {
+  try {
+    // 1. В iOS 16.4+ принудительно переключаем аудио-сессию в режим 'playback' (игнорирует тумблер Mute на корпусе iPhone)
+    if (navigator.audioSession && navigator.audioSession.type !== 'playback') {
+      navigator.audioSession.type = 'playback';
+    }
+  } catch (e) {}
 
-    // Мастер-компрессор для мягкого склеивания звука без клиппинга
+  // 2. Создаём и СИНХРОННО будим AudioContext до любых тяжёлых вычислений
+  const AudioConstructor = window.AudioContext || window.webkitAudioContext;
+  if (!AudioConstructor) return;
+
+  if (!audioCtx) {
+    audioCtx = new AudioConstructor();
+  }
+
+  if (audioCtx.state === 'suspended' || audioCtx.state === 'interrupted') {
+    audioCtx.resume().catch(() => {});
+  }
+
+  // 3. Синхронно запускаем пустой буфер прямо внутри пользовательского тапа (обязательное требование WebKit/iOS)
+  if (!audioUnlocked && audioCtx) {
+    try {
+      const silentBuf = audioCtx.createBuffer(1, 1, 22050);
+      const src = audioCtx.createBufferSource();
+      src.buffer = silentBuf;
+      src.connect(audioCtx.destination);
+      if (src.start) {
+        src.start(0);
+      } else if (src.noteOn) {
+        src.noteOn(0);
+      }
+      audioUnlocked = true;
+    } catch (e) {}
+  }
+
+  // 4. Запускаем HTML5 <audio> элемент для обхода аппаратного беззвучного режима на iPhone
+  try {
+    if (!iosMediaUnlocker) {
+      iosMediaUnlocker = new Audio(SILENT_WAV_DATA_URI);
+      iosMediaUnlocker.setAttribute('playsinline', '');
+      iosMediaUnlocker.setAttribute('webkit-playsinline', '');
+      iosMediaUnlocker.loop = false;
+      iosMediaUnlocker.volume = 0.01;
+    }
+    const playPromise = iosMediaUnlocker.play();
+    if (playPromise !== undefined) {
+      playPromise.catch(() => {});
+    }
+  } catch (e) {}
+
+  // 5. Инициализируем мастер-шину, компрессор и концертный ревербератор
+  if (audioCtx && !masterBus) {
     const compressor = audioCtx.createDynamicsCompressor();
-    compressor.threshold.setValueAtTime(-18, audioCtx.currentTime);
+    compressor.threshold.setValueAtTime(-16, audioCtx.currentTime);
     compressor.knee.setValueAtTime(24, audioCtx.currentTime);
     compressor.ratio.setValueAtTime(4, audioCtx.currentTime);
     compressor.attack.setValueAtTime(0.01, audioCtx.currentTime);
     compressor.release.setValueAtTime(0.25, audioCtx.currentTime);
     compressor.connect(audioCtx.destination);
 
-    // Стерео-ревербератор зала
     reverbNode = createConcertHallReverb(audioCtx);
     const wetGain = audioCtx.createGain();
     wetGain.gain.setValueAtTime(0.55, audioCtx.currentTime);
@@ -174,23 +226,47 @@ function initAudioEngine() {
     wetGain.connect(compressor);
 
     const dryGain = audioCtx.createGain();
-    dryGain.gain.setValueAtTime(0.75, audioCtx.currentTime);
+    dryGain.gain.setValueAtTime(0.85, audioCtx.currentTime);
     dryGain.connect(compressor);
 
     masterBus = audioCtx.createGain();
-    masterBus.gain.setValueAtTime(0.85, audioCtx.currentTime);
+    masterBus.gain.setValueAtTime(1.05, audioCtx.currentTime);
     masterBus.connect(dryGain);
     masterBus.connect(reverbNode);
   }
-  if (audioCtx && audioCtx.state === 'suspended') {
-    audioCtx.resume();
+}
+
+function initAudioEngine() {
+  unlockMobileAudio();
+  if (audioCtx && (audioCtx.state === 'suspended' || audioCtx.state === 'interrupted')) {
+    audioCtx.resume().catch(() => {});
   }
 }
 
-// Реалистичный синтез ноты акустического рояля с обертонами, фильтром молоточка и педалью сустейна
-function playGrandPianoNote(freq, durationSec = 2.4, velocity = 0.085) {
+// Разблокируем аудио при первом же касании экрана на смартфонах
+['touchstart', 'touchend', 'pointerdown', 'click'].forEach((evtName) => {
+  document.addEventListener(evtName, function onFirstTouch() {
+    unlockMobileAudio();
+    if (audioCtx && audioCtx.state === 'running') {
+      document.removeEventListener(evtName, onFirstTouch, true);
+    }
+  }, { capture: true, passive: true });
+});
+
+// При возвращении на вкладку на телефоне возобновляем AudioContext, если система его усыпила
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && isMusicPlaying && audioCtx && audioCtx.state !== 'running') {
+    audioCtx.resume().catch(() => {});
+  }
+});
+
+// Реалистичный синтез ноты акустического рояля с поддержкой точного планирования времени (offsetSec)
+function playGrandPianoNote(freq, durationSec = 2.4, velocity = 0.095, offsetSec = 0) {
   if (!audioCtx || !masterBus || !freq) return;
-  const now = audioCtx.currentTime;
+  if (audioCtx.state === 'suspended' || audioCtx.state === 'interrupted') {
+    audioCtx.resume().catch(() => {});
+  }
+  const now = audioCtx.currentTime + Math.max(0, offsetSec);
 
   const noteGain = audioCtx.createGain();
   // Динамический фильтр низких частот (имитирует мягкий фетр молоточка рояля и естественное затухание)
@@ -237,13 +313,13 @@ function playGrandPianoNote(freq, durationSec = 2.4, velocity = 0.085) {
 }
 
 // Тёплый бархатный струнный пэд (виолончели и скрипки на фоне)
-function playWarmStringPad(chordFreqs, durationSec = 3.2, volume = 0.024) {
+function playWarmStringPad(chordFreqs, durationSec = 3.2, volume = 0.028, offsetSec = 0) {
   if (!audioCtx || !masterBus || !chordFreqs) return;
-  const now = audioCtx.currentTime;
+  const now = audioCtx.currentTime + Math.max(0, offsetSec);
 
   const padFilter = audioCtx.createBiquadFilter();
   padFilter.type = 'lowpass';
-  padFilter.frequency.setValueAtTime(520, now);
+  padFilter.frequency.setValueAtTime(540, now);
   padFilter.Q.setValueAtTime(0.5, now);
 
   const padGain = audioCtx.createGain();
@@ -268,12 +344,14 @@ function playWarmStringPad(chordFreqs, durationSec = 3.2, volume = 0.024) {
   });
 }
 
+// Торжественный перезвон планируем напрямую через часы Web Audio (без setTimeout),
+// чтобы первая нота запускалась строго синхронно внутри клика/тапа на мобильном!
 function playRomanticChime() {
   initAudioEngine();
   if (!audioCtx) return;
   const notes = [N.A4, N.Cs5, N.E5, N.A5];
   notes.forEach((f, idx) => {
-    setTimeout(() => playGrandPianoNote(f, 2.2, 0.065), idx * 110);
+    playGrandPianoNote(f, 2.2, 0.075, idx * 0.11);
   });
 }
 
@@ -289,24 +367,24 @@ function startMusicLoop() {
 
   const triggerStep = () => {
     if (!isMusicPlaying) return;
+    if (audioCtx && (audioCtx.state === 'suspended' || audioCtx.state === 'interrupted')) {
+      audioCtx.resume().catch(() => {});
+    }
     const step = song.steps[beatIndex % song.steps.length];
     if (step.pad) {
-      playWarmStringPad(step.pad, (song.stepMs / 1000) * 7.5, 0.022);
+      playWarmStringPad(step.pad, (song.stepMs / 1000) * 7.5, 0.026, 0);
     }
     if (step.arp) {
-      playGrandPianoNote(step.arp, step.dur || 2.0, 0.052);
+      playGrandPianoNote(step.arp, step.dur || 2.0, 0.06, 0);
     }
     if (step.mel) {
-      // Лёгкая задержка правой руки пианиста (18 мс) для живого человеческого исполнения
-      setTimeout(() => {
-        if (isMusicPlaying) {
-          playGrandPianoNote(step.mel, (step.dur || 2.2) * 1.15, 0.088);
-        }
-      }, 18);
+      // Лёгкая задержка правой руки пианиста (18 мс) через аппаратный таймер audioCtx.currentTime
+      playGrandPianoNote(step.mel, (step.dur || 2.2) * 1.15, 0.098, 0.018);
     }
     beatIndex++;
   };
 
+  // Запускаем первый шаг СИНХРОННО внутри обработчика нажатия (критично для iOS/Android)
   triggerStep();
   schedulerTimer = setInterval(triggerStep, song.stepMs);
 }
@@ -351,9 +429,12 @@ function openGreetingLetter() {
   if (isOpening) return;
   isOpening = true;
 
+  // Запускаем аудио-движок и музыку СИНХРОННО внутри события клика/тапа,
+  // чтобы мобильные браузеры (iOS Safari / Android Chrome) не заблокировали звук
+  unlockMobileAudio();
   playRomanticChime();
   if (!isMusicPlaying) {
-    setTimeout(() => startMusicLoop(), 350);
+    startMusicLoop();
   }
 
   envelopeBox.classList.add('opening');
